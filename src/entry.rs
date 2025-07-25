@@ -55,11 +55,17 @@ impl Entry {
     }
 
     pub(crate) fn is_deleted_or_tombstone(&self) -> bool {
-        if let Some(metadata) = &self.metadata {
-            metadata.is_deleted_or_tombstone()
-        } else {
-            false
-        }
+        self.metadata
+            .as_ref()
+            .map(|m| m.is_deleted_or_tombstone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .map(|m| m.is_tombstone())
+            .unwrap_or_default()
     }
 }
 

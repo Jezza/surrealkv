@@ -12,7 +12,7 @@ use crate::iter::{KeyScanIterator, MergingScanIterator, VersionScanIterator};
 use crate::option::IsolationLevel;
 use crate::snapshot::Snapshot;
 use crate::store::Core;
-use crate::util::{convert_range_bounds, now};
+use crate::util::{convert_range_bounds, convert_range_bounds_bytes, now};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -764,10 +764,11 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
 
-        let snap = self.snapshot.as_ref().unwrap();
-        let snap_iter = snap.range_with_versions(range);
+        let range_bytes = convert_range_bounds_bytes(&range);
 
-        VersionScanIterator::new(&self.core, snap_iter, limit)
+        let snap_iter = self.snapshot.as_ref().unwrap().range_with_versions(range);
+
+        VersionScanIterator::new(&self.core, &self.write_set, snap_iter, range_bytes, limit)
     }
 
     #[allow(unused)]

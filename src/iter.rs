@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
+use std::ops::Bound;
 use std::{
     cmp::Ordering,
     collections::{btree_map, VecDeque},
@@ -5,9 +8,6 @@ use std::{
     marker::PhantomData,
     ops::RangeBounds,
 };
-
-use bytes::Bytes;
-use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use vart::VariableSizeKey;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     store::Core,
     transaction::{ReadSet, ReadSetEntry, ScanResult, ScanVersionResult, WriteSet, WriteSetEntry},
     util::convert_range_bounds_bytes,
-    Result,
+    Error, Result,
 };
 
 // Fields: key, value, version, ts
@@ -362,7 +362,8 @@ where
 /// Optionally limits the number of unique keys returned.
 pub struct VersionScanIterator<'a, I: Iterator> {
     snap_iter: Peekable<I>,
-    current_key_versions: VecDeque<(&'a [u8], Vec<u8>, u64, bool)>,
+    current_key_versions: VecDeque<ScanVersionResult<'a>>,
+    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     unique_keys_count: usize,
     current_key: Option<&'a [u8]>, // Track current key to detect changes
     limit: Option<usize>,
@@ -373,15 +374,70 @@ impl<'a, I: Iterator> VersionScanIterator<'a, I>
 where
     I: Iterator<Item = SnapItem<'a>>,
 {
-    pub(crate) fn new(core: &'a Core, snap_iter: I, limit: Option<usize>) -> Self {
+    pub(crate) fn new(
+        core: &'a Core,
+        write_set: &'a WriteSet,
+        snap_iter: I,
+        range_bytes: (Bound<Bytes>, Bound<Bytes>),
+        limit: Option<usize>,
+    ) -> Self {
         Self {
             snap_iter: snap_iter.peekable(),
+            write_set_iter: write_set.range(range_bytes).peekable(),
             current_key_versions: VecDeque::new(),
             unique_keys_count: 0,
             current_key: None,
             limit,
             core,
         }
+    }
+
+    fn read_next_from_snapshot(&mut self) -> Result<()> {
+        // Process version
+        let (key, value, _, ts) = self
+            .snap_iter
+            .next()
+            .unwrap_or_else(|| unreachable!("internal error: function shouldn't have been called"));
+
+        let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
+        let v = value.resolve(self.core)?;
+
+        // Add first version
+        self.current_key_versions
+            .push_back((key, v, ts, is_deleted));
+
+        // Collect all other versions for this key
+        while let Some(&(next_key, value, _, ts)) = self.snap_iter.peek() {
+            if next_key != key {
+                break;
+            }
+            // Consume the peeked item
+            self.snap_iter.next();
+            let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
+            if let Ok(v) = value.resolve(self.core) {
+                self.current_key_versions
+                    .push_back((key, v, ts, is_deleted));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_next_from_write_set(&mut self) -> Result<()> {
+        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap_or_else(|| {
+            unreachable!("internal error: function should not have been called")
+        });
+
+        for entry in ws_entries.iter() {
+            self.current_key_versions.push_back((
+                (*ws_key).as_ref(),
+                entry.e.value.to_vec(),
+                entry.e.ts,
+                entry.e.is_tombstone(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -397,13 +453,50 @@ where
             return Some(Ok(version));
         }
 
-        // Get next item
-        let next_item = self.snap_iter.next()?;
-        let (key, value, _, ts) = next_item;
+        enum ReadFrom {
+            Snap,
+            WriteSet,
+        }
+
+        let read_from = {
+            let snap_item = self.snap_iter.peek();
+            let ws_item = self.write_set_iter.peek();
+
+            match (snap_item, ws_item) {
+                (None, None) => {
+                    return None;
+                }
+                (Some((snap_key, _, _, _)), Some((ws_key, _))) => {
+                    match snap_key.cmp(&ws_key.as_ref()) {
+                        Ordering::Less => ReadFrom::Snap,
+                        Ordering::Greater => ReadFrom::WriteSet,
+                        Ordering::Equal => {
+                            // self.snap_iter.next(); // Skip snapshot entry
+                            ReadFrom::WriteSet
+                        }
+                    }
+                }
+                (Some(_), None) => ReadFrom::Snap,
+                (None, Some(_)) => ReadFrom::WriteSet,
+            }
+        };
+
+        let result = match read_from {
+            ReadFrom::Snap => self.read_next_from_snapshot(),
+            ReadFrom::WriteSet => self.read_next_from_write_set(),
+        };
+
+        if let Err(err) = result {
+            return Some(Err(err));
+        }
+
+        // @TODO jezza - 24 July 2025: Ideally, check this _before_ reading a lot of keys...
+
+        let result = self.current_key_versions.pop_front()?;
 
         // Check if this is a new key
-        if self.current_key != Some(key) {
-            self.current_key = Some(key);
+        if self.current_key != Some(result.0) {
+            self.current_key = Some(result.0);
             self.unique_keys_count += 1;
 
             // Check limit
@@ -414,32 +507,6 @@ where
             }
         }
 
-        // Process version
-        let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
-        match value.resolve(self.core) {
-            Ok(v) => {
-                // Add first version
-                self.current_key_versions
-                    .push_back((key, v, ts, is_deleted));
-
-                // Collect all other versions for this key
-                while let Some(&(next_key, value, _, ts)) = self.snap_iter.peek() {
-                    if next_key != key {
-                        break;
-                    }
-                    // Consume the peeked item
-                    self.snap_iter.next();
-                    let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
-                    if let Ok(v) = value.resolve(self.core) {
-                        self.current_key_versions
-                            .push_back((key, v, ts, is_deleted));
-                    }
-                }
-
-                // The next iteration will handle returning the first version
-                self.next()
-            }
-            Err(e) => Some(Err(e)),
-        }
+        Some(Ok(result))
     }
 }
