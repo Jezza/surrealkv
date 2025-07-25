@@ -479,7 +479,7 @@ impl Transaction {
         // respecting the insertion order recorded with WriteSetEntry::seqno.
         let mut latest_writes: Vec<WriteSetEntry> = std::mem::take(&mut self.write_set)
             .into_values()
-            .filter_map(|mut entries| entries.pop())
+            .flatten()
             .collect();
         latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
         let entries: Vec<Entry> = latest_writes
